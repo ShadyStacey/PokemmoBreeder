@@ -9,7 +9,7 @@ IVs, Everstone for nature, and egg moves being carried through the line).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 import argparse
 import logging
 import sys
@@ -49,6 +49,15 @@ class BreedingStep:
         bullet = f"Step {idx}:"
         notes_block = "\n".join(f"    - {note}" for note in self.notes)
         return f"{bullet} Breed {self.parent_a.label()} with {self.parent_b.label()} -> {self.child.label()}\n{notes_block}\n"
+
+
+@dataclass
+class PlanResult:
+    """Container for the full breeding roadmap."""
+
+    steps: List[BreedingStep]
+    base_parents: List[PokemonPlan]
+    final_child: Optional[PokemonPlan]
 
 
 def parse_ivs(raw: str) -> Dict[str, int]:
@@ -127,15 +136,16 @@ def merge_plans(plan_a: PokemonPlan, plan_b: PokemonPlan, target_nature: Optiona
     return child, BreedingStep(plan_a, plan_b, child, notes)
 
 
-def build_breeding_plan(target_ivs: Dict[str, int], nature: Optional[str], egg_moves: List[str]) -> List[BreedingStep]:
+def build_breeding_plan(target_ivs: Dict[str, int], nature: Optional[str], egg_moves: List[str]) -> PlanResult:
     required_perfects = find_required_perfects(target_ivs)
     parents = build_base_parents(required_perfects, nature, egg_moves)
+    base_parents = parents.copy()
 
     logging.info("Building breeding plan")
     logging.info("Starting parents: %s", [p.label() for p in parents])
 
     if not parents:
-        return []
+        return PlanResult([], [], None)
 
     steps: List[BreedingStep] = []
     # Greedy merge: always combine the two smallest parents to minimize cost.
@@ -151,10 +161,90 @@ def build_breeding_plan(target_ivs: Dict[str, int], nature: Optional[str], egg_m
         parents.append(child)
         logging.debug("Parents after merge: %s", [p.label() for p in parents])
 
-    return steps
+    final_child = parents[0] if parents else None
+    return PlanResult(steps, base_parents, final_child)
 
 
-def format_plan(steps: List[BreedingStep], target_ivs: Dict[str, int], nature: Optional[str], egg_moves: List[str]) -> str:
+def format_flowchart(plan: PlanResult) -> str:
+    if not plan.final_child:
+        return "No steps required."
+
+    step_lookup = {id(step.child): step for step in plan.steps}
+
+    def render(node: PokemonPlan, prefix: str = "") -> List[str]:
+        lines = [f"{prefix}{node.label()}"]
+        if id(node) not in step_lookup:
+            return lines
+
+        step = step_lookup[id(node)]
+        children = [step.parent_a, step.parent_b]
+        for idx, child in enumerate(children):
+            last = idx == len(children) - 1
+            connector = "└─ " if last else "├─ "
+            extension = "   " if last else "│  "
+            child_lines = render(child, prefix + extension)
+            child_lines[0] = f"{prefix}{connector}{child.label()}"
+            lines.extend(child_lines)
+        return lines
+
+    header = ["Flowchart", "---------"]
+    header.extend(render(plan.final_child))
+    return "\n".join(header)
+
+
+def summarize_resources(plan: PlanResult, nature: Optional[str]) -> Tuple[str, Dict[str, int]]:
+    brace_counts: Dict[str, int] = {stat: 0 for stat in STATS}
+    everstone_count = 0
+    for step in plan.steps:
+        for parent in (step.parent_a, step.parent_b):
+            for stat in parent.perfect_stats:
+                brace_counts[stat] += 1
+        if nature and (step.parent_a.nature or step.parent_b.nature):
+            everstone_count += 1
+
+    items_lines = ["Required items:"]
+    total_braces = 0
+    for stat, count in brace_counts.items():
+        if count:
+            items_lines.append(f"- {count}x {stat.upper()} brace")
+            total_braces += count
+    if everstone_count:
+        items_lines.append(f"- {everstone_count}x Everstone")
+    if not items_lines[1:]:
+        items_lines.append("- None")
+
+    pokemon_lines = ["Starting parents (assumed 1x31 or nature-only):"]
+    for parent in plan.base_parents:
+        pokemon_lines.append(f"- {parent.label()}")
+
+    summary = "\n".join(items_lines + ["", "Required Pokémon:"] + pokemon_lines)
+    return summary, {"total_braces": total_braces, "everstones": everstone_count}
+
+
+def estimate_costs(costs: Dict[str, int], counts: Dict[str, int], base_parents: Iterable[PokemonPlan]) -> Tuple[str, int]:
+    brace_total = counts.get("total_braces", 0) * costs.get("brace", 0)
+    everstone_total = counts.get("everstones", 0) * costs.get("everstone", 0)
+
+    base_list = list(base_parents)
+    parent_total = 0
+    for parent in base_list:
+        if parent.nature:
+            parent_total += costs.get("nature_parent", 0)
+        elif parent.egg_moves:
+            parent_total += costs.get("egg_carrier", 0)
+        elif parent.perfect_stats:
+            parent_total += costs.get("stat_parent", 0)
+
+    total = brace_total + everstone_total + parent_total
+    breakdown = ["Cost estimate:"]
+    breakdown.append(f"- Braces: {counts.get('total_braces', 0)} x {costs.get('brace', 0)} = {brace_total}")
+    breakdown.append(f"- Everstones: {counts.get('everstones', 0)} x {costs.get('everstone', 0)} = {everstone_total}")
+    breakdown.append(f"- Base parents: {len(base_list)} x (custom) = {parent_total}")
+    breakdown.append(f"Total estimated cost: {total}")
+    return "\n".join(breakdown), total
+
+
+def format_plan(plan: PlanResult, target_ivs: Dict[str, int], nature: Optional[str], egg_moves: List[str], cost_summary: Optional[str] = None) -> str:
     header = ["Breeding roadmap", "================", ""]
     header.append("Target summary:")
     header.append("- IVs: " + ", ".join(f"{stat.upper()}={value}" for stat, value in target_ivs.items()))
@@ -162,11 +252,14 @@ def format_plan(steps: List[BreedingStep], target_ivs: Dict[str, int], nature: O
     header.append(f"- Egg moves: {', '.join(egg_moves) if egg_moves else 'none'}")
     header.append("")
 
-    if not steps:
+    if not plan.steps:
         header.append("No steps required. You already have the target Pokémon!")
         return "\n".join(header)
 
-    body = [step.describe(idx + 1) for idx, step in enumerate(steps)]
+    body = [step.describe(idx + 1) for idx, step in enumerate(plan.steps)]
+    flowchart = format_flowchart(plan)
+    resources_text, counts = summarize_resources(plan, nature)
+    cost_block = cost_summary or ""
     tips = textwrap.dedent(
         """
         Extra tips:
@@ -176,7 +269,12 @@ def format_plan(steps: List[BreedingStep], target_ivs: Dict[str, int], nature: O
         """
     )
 
-    return "\n".join(header + body + [tips])
+    sections = header + body + [flowchart, resources_text]
+    if cost_block:
+        sections.append("")
+        sections.append(cost_block)
+    sections.append(tips)
+    return "\n".join(sections)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -211,10 +309,29 @@ def run_gui() -> None:
     egg_var = tk.StringVar()
     ttk.Entry(main_frame, textvariable=egg_var, width=60).grid(row=5, column=0, sticky="ew")
 
-    output = tk.Text(main_frame, width=80, height=20, wrap="word")
-    output.grid(row=7, column=0, sticky="nsew", pady=(10, 0))
+    # Cost inputs
+    ttk.Label(main_frame, text="Brace price:").grid(row=6, column=0, sticky="w", pady=(8, 0))
+    brace_price_var = tk.StringVar(value="20000")
+    ttk.Entry(main_frame, textvariable=brace_price_var, width=20).grid(row=7, column=0, sticky="w")
 
-    main_frame.rowconfigure(7, weight=1)
+    ttk.Label(main_frame, text="Everstone price:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+    everstone_price_var = tk.StringVar(value="20000")
+    ttk.Entry(main_frame, textvariable=everstone_price_var, width=20).grid(row=9, column=0, sticky="w")
+
+    ttk.Label(main_frame, text="Base parent prices (31 IV / nature / egg carrier):").grid(row=10, column=0, sticky="w", pady=(8, 0))
+    stat_parent_price_var = tk.StringVar(value="0")
+    nature_parent_price_var = tk.StringVar(value="0")
+    egg_carrier_price_var = tk.StringVar(value="0")
+    prices_frame = ttk.Frame(main_frame)
+    prices_frame.grid(row=11, column=0, sticky="w")
+    ttk.Entry(prices_frame, textvariable=stat_parent_price_var, width=10).grid(row=0, column=0, padx=(0, 4))
+    ttk.Entry(prices_frame, textvariable=nature_parent_price_var, width=10).grid(row=0, column=1, padx=(0, 4))
+    ttk.Entry(prices_frame, textvariable=egg_carrier_price_var, width=10).grid(row=0, column=2, padx=(0, 4))
+
+    output = tk.Text(main_frame, width=80, height=25, wrap="word")
+    output.grid(row=13, column=0, sticky="nsew", pady=(10, 0))
+
+    main_frame.rowconfigure(13, weight=1)
     main_frame.columnconfigure(0, weight=1)
 
     def on_plan() -> None:
@@ -222,8 +339,17 @@ def run_gui() -> None:
         try:
             target_ivs = parse_ivs(ivs_var.get())
             egg_moves = [move.strip() for move in egg_var.get().split(",") if move.strip()]
-            steps = build_breeding_plan(target_ivs, nature_var.get() or None, egg_moves)
-            plan_text = format_plan(steps, target_ivs, nature_var.get() or None, egg_moves)
+            plan = build_breeding_plan(target_ivs, nature_var.get() or None, egg_moves)
+            _, counts = summarize_resources(plan, nature_var.get() or None)
+            costs = {
+                "brace": int(brace_price_var.get() or 0),
+                "everstone": int(everstone_price_var.get() or 0),
+                "stat_parent": int(stat_parent_price_var.get() or 0),
+                "nature_parent": int(nature_parent_price_var.get() or 0),
+                "egg_carrier": int(egg_carrier_price_var.get() or 0),
+            }
+            cost_summary, _ = estimate_costs(costs, counts, plan.base_parents)
+            plan_text = format_plan(plan, target_ivs, nature_var.get() or None, egg_moves, cost_summary)
         except Exception as exc:  # noqa: BLE001 - surface any GUI errors directly
             logging.exception("Error while building plan")
             plan_text = f"Error: {exc}"
@@ -232,7 +358,7 @@ def run_gui() -> None:
         output.insert(tk.END, plan_text)
         output.see(tk.END)
 
-    ttk.Button(main_frame, text="Generate Plan", command=on_plan).grid(row=6, column=0, sticky="e", pady=(8, 0))
+    ttk.Button(main_frame, text="Generate Plan", command=on_plan).grid(row=12, column=0, sticky="e", pady=(8, 0))
 
     window.mainloop()
 
@@ -242,6 +368,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--ivs", default="", help="Comma list of stat=value (hp,atk,def,spatk,spdef,spe). Example: hp=31,atk=31,def=31")
     parser.add_argument("--nature", default=None, help="Desired nature (e.g., Adamant).")
     parser.add_argument("--egg-moves", default="", help="Comma-separated egg moves to preserve")
+    parser.add_argument("--brace-price", type=int, default=20000, help="Price per brace in Pokéyen")
+    parser.add_argument("--everstone-price", type=int, default=20000, help="Price per Everstone in Pokéyen")
+    parser.add_argument("--stat-parent-price", type=int, default=0, help="Price per 1x31 base parent")
+    parser.add_argument("--nature-parent-price", type=int, default=0, help="Price for the nature parent")
+    parser.add_argument("--egg-carrier-price", type=int, default=0, help="Price for the egg move carrier")
     parser.add_argument("--gui", action="store_true", help="Launch the visual planner interface")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logging")
     args = parser.parse_args(argv)
@@ -261,8 +392,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.info("Target nature: %s", args.nature)
     logging.info("Egg moves: %s", egg_moves)
 
-    steps = build_breeding_plan(target_ivs, args.nature, egg_moves)
-    print(format_plan(steps, target_ivs, args.nature, egg_moves))
+    plan = build_breeding_plan(target_ivs, args.nature, egg_moves)
+    _, counts = summarize_resources(plan, args.nature)
+    costs = {
+        "brace": args.brace_price,
+        "everstone": args.everstone_price,
+        "stat_parent": args.stat_parent_price,
+        "nature_parent": args.nature_parent_price,
+        "egg_carrier": args.egg_carrier_price,
+    }
+    cost_summary, _ = estimate_costs(costs, counts, plan.base_parents)
+    print(format_plan(plan, target_ivs, args.nature, egg_moves, cost_summary))
 
 
 if __name__ == "__main__":
